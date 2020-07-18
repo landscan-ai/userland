@@ -69,6 +69,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "interface/mmal/util/mmal_default_components.h"
 #include "interface/mmal/util/mmal_connection.h"
 #include "interface/mmal/mmal_parameters_camera.h"
+#include "host_applications/linux/libs/sm/user-vcsm.h"
 
 #include "RaspiCommonSettings.h"
 #include "RaspiCamControl.h"
@@ -158,6 +159,8 @@ typedef struct
    MMAL_POOL_T *encoder_pool; /// Pointer to the pool of buffers used by encoder output port
 
    RASPITEX_STATE raspitex_state; /// GL renderer state and parameters
+   
+   unsigned int lens_shading;  
 
 } RASPISTILL_STATE;
 
@@ -822,6 +825,17 @@ static MMAL_STATUS_T create_camera_component(RASPISTILL_STATE *state)
       goto error;
    }
 
+   if(state->wantRAW)
+   {
+      status = mmal_port_parameter_set_uint32(camera->control, MMAL_PARAMETER_CAMERA_ISP_BLOCK_OVERRIDE, ~8);
+
+      if (status != MMAL_SUCCESS)
+      {
+         vcos_log_error("Could not set sensor mode : error %d", status);
+         goto error;
+      }
+   }
+
    preview_port = camera->output[MMAL_CAMERA_PREVIEW_PORT];
    video_port = camera->output[MMAL_CAMERA_VIDEO_PORT];
    still_port = camera->output[MMAL_CAMERA_CAPTURE_PORT];
@@ -859,6 +873,31 @@ static MMAL_STATUS_T create_camera_component(RASPISTILL_STATE *state)
       }
 
       mmal_port_parameter_set(camera->control, &cam_config.hdr);
+   }
+   {
+      MMAL_PARAMETER_LENS_SHADING_T ls = {{MMAL_PARAMETER_LENS_SHADING_OVERRIDE, sizeof(MMAL_PARAMETER_LENS_SHADING_T)}};
+      void *grid;
+
+      #include "ls_table.h"
+
+      ls.enabled = MMAL_TRUE;
+      ls.grid_cell_size = 64;
+      ls.grid_width = ls.grid_stride = grid_width;
+      ls.grid_height = grid_height;
+      ls.ref_transform = ref_transform;
+
+      state->lens_shading = vcsm_malloc(ls.grid_stride*ls.grid_height*4, "ls_grid");
+      ls.mem_handle_table = vcsm_vc_hdl_from_hdl(state->lens_shading);
+
+      grid = vcsm_lock(state->lens_shading);
+
+      memcpy(grid, ls_grid, vcos_min(sizeof(ls_grid), ls.grid_stride*ls.grid_height*4));
+
+      vcsm_unlock_hdl(state->lens_shading);
+
+      status = mmal_port_parameter_set(camera->control, &ls.hdr);
+      if (status != MMAL_SUCCESS)
+         vcos_log_error("Failed to set lens shading parameters - %d", status);
    }
 
    raspicamcontrol_set_all_parameters(camera, &state->camera_parameters);
@@ -1648,6 +1687,7 @@ int main(int argc, const char **argv)
    MMAL_PORT_T *encoder_output_port = NULL;
 
    bcm_host_init();
+   vcsm_init();
 
    // Register our application with the logging system
    vcos_log_register("RaspiStill", VCOS_LOG_CATEGORY);
@@ -2064,6 +2104,10 @@ error:
 
    if (status != MMAL_SUCCESS)
       raspicamcontrol_check_configuration(128);
+   
+   if (state.lens_shading)
+      vcsm_free(state.lens_shading);
+   vcsm_exit();
 
    return exit_code;
 }
